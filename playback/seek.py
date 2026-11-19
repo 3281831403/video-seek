@@ -21,9 +21,48 @@ Nothing here sleeps, uses randomness or touches the network.
 
 from __future__ import annotations
 
+from numbers import Integral
+
 
 class SeekError(ValueError):
     """Raised when a seek index, target, strategy or batch is invalid."""
+
+
+def _is_int(value):
+    """Return True for genuine integers (``bool`` is not a time value)."""
+
+    return isinstance(value, Integral) and not isinstance(value, bool)
+
+
+def _round_half_up(numerator, denominator):
+    """Round a non-negative rational to the nearest integer, halves up.
+
+    Using integer arithmetic keeps frame numbers stable (no float fps drift)
+    and avoids the banker's rounding of :func:`round`.
+    """
+
+    quotient, remainder = divmod(numerator, denominator)
+    if remainder * 2 >= denominator:
+        quotient += 1
+    return quotient
+
+
+def _fps_ratio(fps):
+    """Normalise ``fps`` to an exact positive ``(num, den)`` pair."""
+
+    if _is_int(fps):
+        num, den = fps, 1
+    elif isinstance(fps, (tuple, list)) and len(fps) == 2:
+        num, den = fps
+        if not (_is_int(num) and _is_int(den)):
+            raise SeekError("fps components must be integers")
+    else:
+        # Floats are explicitly rejected: 29.97 as a float would drift.
+        raise SeekError("fps must be an integer or an exact (num, den) pair")
+
+    if num <= 0 or den <= 0:
+        raise SeekError("fps must be positive")
+    return num, den
 
 
 def find_keyframe(index, target_ms):
@@ -43,7 +82,29 @@ def find_keyframe(index, target_ms):
     milliseconds; the 1 ms tolerance applies when callers compare times.
     """
 
-    raise NotImplementedError
+    keyframes = index["keyframes"]
+    if target_ms < 0:
+        raise SeekError("target must be non-negative")
+
+    length = len(keyframes)
+    if length == 0:
+        raise SeekError("index contains no keyframes")
+
+    first = keyframes[0]
+    if target_ms < first:
+        return first
+
+    # Binary search for the last keyframe <= target_ms.  Only len() and
+    # integer indexing are used, so a read-counting wrapper sees O(log n)
+    # accesses.
+    low, high = 0, length - 1
+    while low < high:
+        middle = (low + high + 1) // 2
+        if keyframes[middle] <= target_ms:
+            low = middle
+        else:
+            high = middle - 1
+    return keyframes[low]
 
 
 def seek_plan(index, target_ms, strategy):
@@ -64,7 +125,18 @@ def seek_plan(index, target_ms, strategy):
     milliseconds and compare with a 1 ms tolerance.
     """
 
-    raise NotImplementedError
+    if strategy not in ("precise", "fast"):
+        raise SeekError(f"unsupported seek strategy: {strategy!r}")
+
+    clamped = clamp_target(index, target_ms)
+    keyframe = find_keyframe(index, clamped)
+    decode_to = clamped if strategy == "precise" else keyframe
+
+    return {
+        "keyframe": keyframe,
+        "decode_to": decode_to,
+        "delta_ms": clamped - keyframe,
+    }
 
 
 def clamp_target(index, target_ms):
@@ -77,7 +149,16 @@ def clamp_target(index, target_ms):
     integer millisecond value and compares with a 1 ms tolerance.
     """
 
-    raise NotImplementedError
+    if not _is_int(target_ms):
+        raise SeekError("target must be an integer number of milliseconds")
+    if target_ms < 0:
+        raise SeekError("target must be non-negative")
+
+    duration = index["duration"]
+    if not _is_int(duration) or duration < 0:
+        raise SeekError("index duration must be a non-negative integer")
+
+    return target_ms if target_ms <= duration else duration
 
 
 def pts_to_frame(pts, timescale, fps):
@@ -98,7 +179,15 @@ def pts_to_frame(pts, timescale, fps):
     tolerance applies to timestamp comparisons.
     """
 
-    raise NotImplementedError
+    if not _is_int(pts) or pts < 0:
+        raise SeekError("pts must be a non-negative integer")
+    if not _is_int(timescale) or timescale <= 0:
+        raise SeekError("timescale must be a positive integer")
+
+    num, den = _fps_ratio(fps)
+
+    ticks = pts * timescale // 1000
+    return _round_half_up(ticks * num, den * timescale)
 
 
 def frame_to_pts(frame, timescale, fps):
@@ -117,7 +206,15 @@ def frame_to_pts(frame, timescale, fps):
     milliseconds and compare with a 1 ms tolerance.
     """
 
-    raise NotImplementedError
+    if not _is_int(frame) or frame < 0:
+        raise SeekError("frame must be a non-negative integer")
+    if not _is_int(timescale) or timescale <= 0:
+        raise SeekError("timescale must be a positive integer")
+
+    num, den = _fps_ratio(fps)
+
+    ticks = _round_half_up(frame * den * timescale, num)
+    return _round_half_up(ticks * 1000, timescale)
 
 
 def merge_ranges(ranges, gap_ms):
@@ -135,7 +232,35 @@ def merge_ranges(ranges, gap_ms):
     are exact integer milliseconds and compare with a 1 ms tolerance.
     """
 
-    raise NotImplementedError
+    if not _is_int(gap_ms) or gap_ms < 0:
+        raise SeekError("gap_ms must be a non-negative integer")
+
+    pairs = []
+    for item in ranges:
+        if len(item) != 2:
+            raise SeekError("each range must be a (start, end) pair")
+        start, end = item
+        if not (_is_int(start) and _is_int(end)):
+            raise SeekError("range bounds must be integers")
+        if start > end:
+            raise SeekError("range start must not exceed range end")
+        pairs.append((start, end))
+
+    if not pairs:
+        return []
+
+    pairs.sort(key=lambda pair: pair[0])
+
+    merged = [pairs[0]]
+    for start, end in pairs[1:]:
+        current_start, current_end = merged[-1]
+        if start <= current_end + gap_ms:
+            if end > current_end:
+                merged[-1] = (current_start, end)
+        else:
+            merged.append((start, end))
+
+    return merged
 
 
 def estimate_decode_cost(plan, avg_frame_ms):
@@ -153,7 +278,15 @@ def estimate_decode_cost(plan, avg_frame_ms):
     tolerance applies to the millisecond inputs.
     """
 
-    raise NotImplementedError
+    if not _is_int(avg_frame_ms) or avg_frame_ms <= 0:
+        raise SeekError("avg_frame_ms must be a positive integer")
+
+    distance = plan["decode_to"] - plan["keyframe"]
+    if distance <= 0:
+        return 0
+
+    # Integer ceiling division.
+    return -(-distance // avg_frame_ms)
 
 
 def seek_batch(index, targets):
@@ -184,4 +317,28 @@ def seek_batch(index, targets):
     times are integer milliseconds and compare with a 1 ms tolerance.
     """
 
-    raise NotImplementedError
+    duration = index["duration"]
+
+    # Validate the whole batch up front so an invalid entry leaves no
+    # partial result behind.
+    checked = []
+    for target in targets:
+        if not _is_int(target) or target < 0 or target > duration:
+            raise SeekError(f"invalid seek target: {target!r}")
+        checked.append(target)
+
+    if not checked:
+        return {"order": [], "results": [], "decodes": 0}
+
+    ordered = sorted(checked)
+
+    results = [seek_plan(index, target, "precise") for target in ordered]
+
+    decodes = 0
+    previous_keyframe = None
+    for plan in results:
+        if plan["keyframe"] != previous_keyframe:
+            decodes += 1
+            previous_keyframe = plan["keyframe"]
+
+    return {"order": ordered, "results": results, "decodes": decodes}
